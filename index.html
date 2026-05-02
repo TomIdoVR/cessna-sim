@@ -1,0 +1,988 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>United States of Hawaii — Cessna 172</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; overflow: hidden; width: 100vw; height: 100vh; font-family: monospace; }
+#c   { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: block; }
+#hud { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+#crash-screen {
+  position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+  display: none; flex-direction: column; align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.85);
+}
+#crash-screen h1 { color: #FF2020; font-size: 80px; letter-spacing: 8px; text-shadow: 0 0 40px #F00; }
+#crash-screen p  { color: #AA8888; font-size: 18px; margin-top: 20px; }
+#crash-screen button {
+  margin-top: 30px; padding: 12px 32px; background: #333; color: #FFF;
+  border: 1px solid #666; font-family: monospace; font-size: 16px; cursor: pointer;
+}
+#crash-screen button:hover { background: #555; }
+#loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  color: #8AF; font-size: 20px; text-align: center; }
+#controls-hint {
+  position: absolute; bottom: 80px; right: 16px;
+  color: rgba(200,220,255,0.55); font-size: 11px; line-height: 1.7;
+  text-align: right; pointer-events: none; display: none;
+}
+</style>
+</head>
+<body>
+<div id="loading">Loading Hawaii...</div>
+<canvas id="c"></canvas>
+<canvas id="hud"></canvas>
+<div id="crash-screen">
+  <h1>CRASH</h1>
+  <p id="crash-msg">Impact velocity too high.</p>
+  <button onclick="location.reload()">RESTART</button>
+</div>
+<div id="controls-hint">
+  W/↓ Pitch up &nbsp; S/↑ Pitch down<br>
+  A/← Roll left &nbsp; D/→ Roll right<br>
+  Q/E Rudder &nbsp; +/= Throttle up<br>
+  -/– Throttle down &nbsp; G Gear<br>
+  C Camera &nbsp; F Fog &nbsp; N Night
+</div>
+
+<!-- Error handler — catches any JS error and shows it on screen -->
+<script>
+window.onerror = function(msg, src, line) {
+  var el = document.getElementById('loading');
+  el.style.color = '#FF5555';
+  el.innerHTML = '<b>ERROR</b><br>' + msg +
+    '<br><small style="color:#aaa">' + (src||'?') + ':' + (line||'?') + '</small>' +
+    '<br><br>Open <b>F12 → Console</b> for full details.';
+  return true;
+};
+</script>
+
+<!-- Three.js r134 — very stable, definitely has examples/js/ -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.134.0/build/three.min.js"
+  onerror="document.getElementById('loading').innerHTML='❌ three.min.js failed — check internet<br><small>Try: open in Chrome with network access</small>'"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.134.0/examples/js/controls/OrbitControls.js"
+  onerror="console.warn('OrbitControls failed to load')"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.134.0/examples/js/loaders/GLTFLoader.js"
+  onerror="console.warn('GLTFLoader failed to load')"></script>
+
+<script>
+// Bail early with a clear message if Three.js didn't load
+if (typeof THREE === 'undefined') {
+  document.getElementById('loading').innerHTML =
+    '❌ Three.js did not load.<br>' +
+    '<small>Make sure you have internet access, then reload.<br>' +
+    'Or open F12 → Console to see the error.</small>';
+  throw new Error('THREE not loaded');
+}
+document.getElementById('loading').textContent = 'Building island…';
+
+// ─── Unit constants ─────────────────────────────────────────────
+var KT2MS  = 0.514444;
+var MS2KT  = 1 / KT2MS;
+var MS2FPM = 196.850;
+
+// Cessna 172 performance
+var V_STALL  = 47  * KT2MS;
+var V_X      = 59  * KT2MS;
+var V_Y      = 79  * KT2MS;
+var V_CRUISE = 122 * KT2MS;
+var MAX_THRUST = 5200;   // N  (160 hp prop at low speed)
+var MASS       = 880;    // kg  (Cessna 172 empty + pilot)
+var WING_AREA  = 16.2;   // m²
+var GRAVITY    = 9.81;
+
+// World geometry
+var TERRAIN_SIZE = 9000;
+var TERRAIN_SEGS = 200;
+var ISLAND_RX = 2600;
+var ISLAND_RZ = 2000;
+var RWY_X   = 0;
+var RWY_Z   = 1700;
+var RWY_LEN = 620;
+var RWY_WID = 30;
+
+// ─── Renderer / Scene ───────────────────────────────────────────
+var canvas   = document.getElementById('c');
+var renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type    = THREE.PCFSoftShadowMap;
+renderer.toneMapping       = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+
+var scene  = new THREE.Scene();
+var camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.5, 60000);
+
+scene.background = new THREE.Color(0x87CEEB);
+var FOG_COLOR_DAY   = new THREE.Color(0xB8D8EE);
+var FOG_COLOR_NIGHT = new THREE.Color(0x030810);
+var fogEnabled = true;
+scene.fog = new THREE.FogExp2(FOG_COLOR_DAY, 0.00018);
+
+// ─── Lighting ────────────────────────────────────────────────────
+var sun = new THREE.DirectionalLight(0xFFF5D8, 1.8);
+sun.position.set(3000, 5000, -1500);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.near   = 1;
+sun.shadow.camera.far    = 15000;
+sun.shadow.camera.left   = -5000;
+sun.shadow.camera.right  =  5000;
+sun.shadow.camera.top    =  5000;
+sun.shadow.camera.bottom = -5000;
+scene.add(sun);
+
+var ambient = new THREE.AmbientLight(0x8090B0, 0.55);
+scene.add(ambient);
+
+var hemi = new THREE.HemisphereLight(0x88AACC, 0x3D5020, 0.4);
+scene.add(hemi);
+
+// ─── Procedural noise ────────────────────────────────────────────
+function hash(n) { return ((Math.sin(n * 127.1 + 311.7) * 43758.5453) % 1 + 1) % 1; }
+function smoothstep(t) { return t * t * (3 - 2 * t); }
+function valueNoise2(x, z) {
+  var ix = Math.floor(x), iz = Math.floor(z);
+  var fx = x - ix, fz = z - iz;
+  var ux = smoothstep(fx), uz = smoothstep(fz);
+  return hash(ix + iz * 57)     * (1-ux) * (1-uz)
+       + hash(ix+1 + iz * 57)   * ux     * (1-uz)
+       + hash(ix   + (iz+1)*57) * (1-ux) * uz
+       + hash(ix+1 + (iz+1)*57) * ux     * uz;
+}
+function fbm(x, z, oct) {
+  oct = oct || 6;
+  var v = 0, a = 0.5, f = 1;
+  for (var i = 0; i < oct; i++) { v += valueNoise2(x*f, z*f)*a; a*=0.5; f*=2.1; }
+  return v;
+}
+
+// ─── Terrain height ──────────────────────────────────────────────
+function islandFalloff(x, z) {
+  var nx = x / ISLAND_RX, nz = z / ISLAND_RZ;
+  var n  = valueNoise2(x * 0.0003, z * 0.0003) * 0.25;
+  var d  = Math.sqrt(nx*nx + nz*nz) - n;
+  return Math.max(0, 1 - d * d * 1.4);
+}
+
+var H_SEGS  = TERRAIN_SEGS + 1;
+var hCache  = new Float32Array(H_SEGS * H_SEGS);
+
+function computeTerrainHeight(x, z) {
+  var falloff = islandFalloff(x, z);
+  if (falloff <= 0) return -3;
+  var md       = Math.sqrt((x*x)/(900*900) + (z*z)/(700*700));
+  var mountain = 1250 * Math.exp(-md*md) * falloff;
+  var hills    = 350  * fbm(x * 0.00065, z * 0.00065, 5) * falloff;
+  var detail   = 40   * fbm(x * 0.003,   z * 0.003,   3) * falloff;
+  var h = (mountain + hills + detail) * falloff;
+  if (z > 900) {
+    var southT = Math.pow(Math.min(1, (z-900)/1200), 1.8);
+    h = h * (1 - southT * 0.92);
+  }
+  var rdx = Math.max(0, Math.abs(x - RWY_X) - RWY_LEN * 0.5);
+  var rdz = Math.max(0, Math.abs(z - RWY_Z) - RWY_WID * 1.5);
+  var rd  = Math.max(rdx, rdz);
+  if (rd < 80) { var t = Math.max(0, 1 - rd/80); h = h*(1-t) + 3*t; }
+  return Math.max(0, h);
+}
+
+// ─── Build terrain mesh ──────────────────────────────────────────
+var terrainGeo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEGS, TERRAIN_SEGS);
+terrainGeo.rotateX(-Math.PI / 2);
+var tPos = terrainGeo.attributes.position;
+
+for (var iz = 0; iz < H_SEGS; iz++) {
+  for (var ix = 0; ix < H_SEGS; ix++) {
+    var idx = iz * H_SEGS + ix;
+    var wx  = (ix / TERRAIN_SEGS - 0.5) * TERRAIN_SIZE;
+    var wz  = (iz / TERRAIN_SEGS - 0.5) * TERRAIN_SIZE;
+    var h   = computeTerrainHeight(wx, wz);
+    tPos.setY(idx, h);
+    hCache[idx] = h;
+  }
+}
+terrainGeo.computeVertexNormals();
+
+var vColors = new Float32Array(tPos.count * 3);
+for (var i = 0; i < tPos.count; i++) {
+  var hv = tPos.getY(i), r, g, b;
+  if      (hv <   4) { r=0.83; g=0.74; b=0.55; }
+  else if (hv <  80) { r=0.25; g=0.62; b=0.22; }
+  else if (hv < 450) { r=0.11; g=0.48; b=0.12; }
+  else if (hv < 850) { r=0.36; g=0.30; b=0.20; }
+  else               { r=0.92; g=0.93; b=0.99; }
+  vColors[i*3]=r; vColors[i*3+1]=g; vColors[i*3+2]=b;
+}
+terrainGeo.setAttribute('color', new THREE.BufferAttribute(vColors, 3));
+var terrainMesh = new THREE.Mesh(terrainGeo, new THREE.MeshLambertMaterial({ vertexColors: true }));
+terrainMesh.receiveShadow = true;
+scene.add(terrainMesh);
+
+// ─── Height lookup ────────────────────────────────────────────────
+function getTerrainHeight(wx, wz) {
+  var nx = (wx / TERRAIN_SIZE + 0.5) * TERRAIN_SEGS;
+  var nz = (wz / TERRAIN_SIZE + 0.5) * TERRAIN_SEGS;
+  var lix = Math.max(0, Math.min(TERRAIN_SEGS-1, Math.floor(nx)));
+  var liz = Math.max(0, Math.min(TERRAIN_SEGS-1, Math.floor(nz)));
+  var fx = nx-lix, fz = nz-liz;
+  var h00 = hCache[liz*H_SEGS+lix]     || 0;
+  var h10 = hCache[liz*H_SEGS+lix+1]   || 0;
+  var h01 = hCache[(liz+1)*H_SEGS+lix] || 0;
+  var h11 = hCache[(liz+1)*H_SEGS+lix+1]||0;
+  return h00*(1-fx)*(1-fz) + h10*fx*(1-fz) + h01*(1-fx)*fz + h11*fx*fz;
+}
+
+// ─── Ocean water shader ───────────────────────────────────────────
+var waterVS = [
+  'uniform float uTime;',
+  'varying vec2 vUv; varying float vWave;',
+  'void main(){',
+  '  vUv=uv; vec3 p=position;',
+  '  float w = sin(p.x*0.009+uTime*1.3)*0.55 + sin(p.z*0.007+uTime*1.1)*0.45',
+  '          + sin(p.x*0.025+p.z*0.018+uTime*2.1)*0.22 + sin(p.x*0.05-p.z*0.04+uTime*3.0)*0.08;',
+  '  p.y+=w; vWave=w;',
+  '  gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1.0);',
+  '}'
+].join('\n');
+
+var waterFS = [
+  'uniform float uTime;',
+  'varying vec2 vUv; varying float vWave;',
+  'void main(){',
+  '  vec3 deep=vec3(0.01,0.12,0.38); vec3 mid=vec3(0.03,0.28,0.58); vec3 foam=vec3(0.75,0.88,1.0);',
+  '  float wf=smoothstep(0.25,0.75,vWave*0.5+0.5);',
+  '  vec3 col=mix(deep,mid,vUv.y*0.5+0.25); col=mix(col,foam,wf*0.35);',
+  '  float shim=sin(vUv.x*120.0+uTime*4.0)*sin(vUv.y*90.0+uTime*3.2)*0.04; col+=shim;',
+  '  gl_FragColor=vec4(col,0.90);',
+  '}'
+].join('\n');
+
+var waterGeo = new THREE.PlaneGeometry(30000, 30000, 100, 100);
+waterGeo.rotateX(-Math.PI / 2);
+var waterMat = new THREE.ShaderMaterial({
+  vertexShader: waterVS, fragmentShader: waterFS,
+  uniforms: { uTime: { value: 0 } },
+  transparent: true, depthWrite: false
+});
+var waterMesh = new THREE.Mesh(waterGeo, waterMat);
+waterMesh.position.y = 0.5;
+scene.add(waterMesh);
+
+// ─── Runway ───────────────────────────────────────────────────────
+var rwyMesh = new THREE.Mesh(
+  new THREE.PlaneGeometry(RWY_LEN, RWY_WID),
+  new THREE.MeshLambertMaterial({ color: 0x2A2A2A })
+);
+rwyMesh.rotateX(-Math.PI / 2);
+rwyMesh.position.set(RWY_X, 3.15, RWY_Z);
+rwyMesh.receiveShadow = true;
+scene.add(rwyMesh);
+
+var clMat = new THREE.MeshBasicMaterial({ color: 0xFFFFFF });
+for (var ci = -9; ci <= 9; ci++) {
+  if (ci === 0) continue;
+  var cm = new THREE.Mesh(new THREE.PlaneGeometry(22, 1.2), clMat);
+  cm.rotateX(-Math.PI / 2);
+  cm.position.set(RWY_X + ci * 28, 3.22, RWY_Z);
+  scene.add(cm);
+}
+for (var ts = -2; ts <= 2; ts++) {
+  for (var te = -1; te <= 1; te += 2) {
+    var tm = new THREE.Mesh(new THREE.PlaneGeometry(3.5, 12), clMat);
+    tm.rotateX(-Math.PI / 2);
+    tm.position.set(RWY_X + te*(RWY_LEN*0.5-14), 3.22, RWY_Z + ts*4.5);
+    scene.add(tm);
+  }
+}
+
+// Runway edge lights (night)
+var rwyLights = [];
+var rlGeo = new THREE.SphereGeometry(0.45, 4, 4);
+for (var rx = -RWY_LEN*0.5; rx <= RWY_LEN*0.5; rx += 25) {
+  for (var rs = -1; rs <= 1; rs += 2) {
+    var rl = new THREE.Mesh(rlGeo, new THREE.MeshBasicMaterial({ color: 0xFFFFEE }));
+    rl.position.set(RWY_X+rx, 3.3, RWY_Z + rs*RWY_WID*0.5);
+    rl.visible = false;
+    rwyLights.push(rl);
+    scene.add(rl);
+  }
+}
+
+// ─── Town ─────────────────────────────────────────────────────────
+var TOWN_X = -420, TOWN_Z = 1450;
+var buildPalette = [0xDEB887,0xC0B090,0xFFEAC0,0xB0C4DE,0xCDA882,0xD0D0C8];
+var bseed = 42;
+function bRng() { bseed=(bseed*1664525+1013904223)&0xFFFFFFFF; return (bseed>>>0)/0xFFFFFFFF; }
+
+for (var bi = 0; bi < 48; bi++) {
+  var bx = TOWN_X + (bRng()-0.5)*680, bz = TOWN_Z + (bRng()-0.5)*460;
+  var bh2 = 9+bRng()*22, bw = 14+bRng()*28, bd = 14+bRng()*28;
+  var bth = getTerrainHeight(bx, bz);
+  if (bth < 2) continue;
+  var bm = new THREE.Mesh(
+    new THREE.BoxGeometry(bw, bh2, bd),
+    new THREE.MeshLambertMaterial({ color: buildPalette[Math.floor(bRng()*buildPalette.length)] })
+  );
+  bm.position.set(bx, bth+bh2*0.5, bz);
+  bm.castShadow = true;
+  scene.add(bm);
+}
+var townGlow = new THREE.PointLight(0xFF8828, 0, 600);
+townGlow.position.set(TOWN_X, 60, TOWN_Z);
+scene.add(townGlow);
+
+// ─── Roads ───────────────────────────────────────────────────────
+function addRoad(pts, w) {
+  var rMat = new THREE.MeshLambertMaterial({ color: 0x4A4A4A });
+  for (var ri = 0; ri < pts.length-1; ri++) {
+    var x1=pts[ri][0], z1=pts[ri][1], x2=pts[ri+1][0], z2=pts[ri+1][1];
+    var len = Math.hypot(x2-x1, z2-z1);
+    var mx=(x1+x2)/2, mz=(z1+z2)/2, rth=getTerrainHeight(mx,mz);
+    var rGeo2 = new THREE.PlaneGeometry(len, w);
+    rGeo2.rotateX(-Math.PI/2);
+    var rm = new THREE.Mesh(rGeo2, rMat);
+    rm.position.set(mx, rth+0.25, mz);
+    rm.rotation.y = -Math.atan2(z2-z1, x2-x1);
+    scene.add(rm);
+  }
+}
+addRoad([[-2200,1850],[-1200,1760],[-400,1700],[0,1720],[600,1700],[1400,1760],[2200,1850]], 9);
+addRoad([[0,1700],[0,1300],[300,850],[500,350],[200,-100]], 7);
+addRoad([[TOWN_X-250,TOWN_Z],[TOWN_X+250,TOWN_Z]], 6);
+
+// ─── Vegetation (instanced) ───────────────────────────────────────
+var vseed = 1337;
+function vRng() { vseed=(vseed*1664525+1013904223)&0xFFFFFFFF; return (vseed>>>0)/0xFFFFFFFF; }
+
+var treePts = [];
+for (var vattempt = 0; vattempt < 900 && treePts.length < 300; vattempt++) {
+  var vangle = vRng()*Math.PI*2, vdist = 120+vRng()*2000;
+  var tx = Math.cos(vangle)*vdist*1.4, tz = Math.sin(vangle)*vdist;
+  var vth = getTerrainHeight(tx, tz);
+  if (vth < 8 || vth > 980) continue;
+  if (Math.abs(tx-RWY_X)<180 && Math.abs(tz-RWY_Z)<120) continue;
+  if (Math.abs(tx-TOWN_X)<420 && Math.abs(tz-TOWN_Z)<300) continue;
+  var jd = Math.max(0,(vth-8)/120);
+  if (vRng() > 0.3+jd*0.7) continue;
+  treePts.push({ x:tx, y:vth, z:tz });
+}
+
+var trunkInst = new THREE.InstancedMesh(
+  new THREE.CylinderGeometry(0.18, 0.42, 8, 7),
+  new THREE.MeshLambertMaterial({ color: 0x8B6340 }),
+  treePts.length
+);
+var canopyInst = new THREE.InstancedMesh(
+  new THREE.SphereGeometry(3.2, 7, 5),
+  new THREE.MeshLambertMaterial({ color: 0x2D8A2D }),
+  treePts.length
+);
+trunkInst.castShadow = canopyInst.castShadow = true;
+
+var _m = new THREE.Matrix4(), _p = new THREE.Vector3();
+var _q = new THREE.Quaternion(), _s = new THREE.Vector3();
+var _yAxis = new THREE.Vector3(0,1,0);
+for (var ti = 0; ti < treePts.length; ti++) {
+  var tp = treePts[ti], sc = 0.75+vRng()*0.55, trot = vRng()*Math.PI*2;
+  _q.setFromAxisAngle(_yAxis, trot);
+  _p.set(tp.x, tp.y+4*sc, tp.z); _s.setScalar(sc);
+  _m.compose(_p,_q,_s); trunkInst.setMatrixAt(ti,_m);
+  // sphere canopy sits at top of trunk (trunk height 8, so center at 8*sc from ground)
+  _p.set(tp.x, tp.y+8*sc, tp.z);
+  _m.compose(_p,_q,_s); canopyInst.setMatrixAt(ti,_m);
+}
+trunkInst.instanceMatrix.needsUpdate = canopyInst.instanceMatrix.needsUpdate = true;
+scene.add(trunkInst); scene.add(canopyInst);
+
+var gltfLoader = new THREE.GLTFLoader();
+gltfLoader.load('models/tropical-plants.glb', function(gltf) {
+  scene.remove(trunkInst); scene.remove(canopyInst);
+  var tmpl = gltf.scene;
+  tmpl.traverse(function(c){ if(c.isMesh){ c.castShadow=true; c.receiveShadow=true; } });
+  for (var pi=0; pi<treePts.length; pi++) {
+    var cl = tmpl.clone(true), psc = 0.75+Math.random()*0.55;
+    cl.scale.setScalar(psc); cl.position.set(treePts[pi].x, treePts[pi].y, treePts[pi].z);
+    cl.rotation.y = Math.random()*Math.PI*2; scene.add(cl);
+  }
+}, undefined, function(){});
+
+// ─── Stars ────────────────────────────────────────────────────────
+var sv = new Float32Array(4000*3);
+for (var si=0; si<4000; si++) {
+  var sphi=Math.acos(2*Math.random()-1), sth=Math.random()*Math.PI*2, sr=35000;
+  sv[si*3]=sr*Math.sin(sphi)*Math.cos(sth);
+  sv[si*3+1]=Math.abs(sr*Math.cos(sphi));
+  sv[si*3+2]=sr*Math.sin(sphi)*Math.sin(sth);
+}
+var starGeo = new THREE.BufferGeometry();
+starGeo.setAttribute('position', new THREE.BufferAttribute(sv,3));
+var starMesh = new THREE.Points(starGeo, new THREE.PointsMaterial({ color:0xFFFFFF, size:2.5, sizeAttenuation:false }));
+starMesh.visible = false;
+scene.add(starMesh);
+
+// ─── Cessna 172 — improved high-wing geometry ────────────────────
+var planeGroup = new THREE.Group();
+function pMesh(geo, hex) {
+  var m = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color:hex }));
+  m.castShadow = true; m.receiveShadow = true; return m;
+}
+
+// ── Fuselage (three sections: nose cowl, cabin, tail boom) ──
+// Cabin box — tall for high-wing, fits 4 occupants
+var cabin = pMesh(new THREE.BoxGeometry(1.25, 1.45, 4.4), 0xF4F4F2);
+cabin.position.set(0, 0, -0.6); planeGroup.add(cabin);
+
+// Tail boom narrows toward tail
+var tailBoom = pMesh(new THREE.BoxGeometry(1.0, 1.0, 3.6), 0xF4F4F2);
+tailBoom.position.set(0, -0.1, 2.9); planeGroup.add(tailBoom);
+
+// Nose cowling (engine compartment — slightly wider/taller, painted darker)
+var cowl = pMesh(new THREE.BoxGeometry(1.3, 1.3, 1.8), 0xE0E0DE);
+cowl.position.set(0, -0.05, -3.3); planeGroup.add(cowl);
+
+// Nose cone
+var coneG = new THREE.CylinderGeometry(0.05, 0.58, 1.2, 10); coneG.rotateX(Math.PI/2);
+var noseCone = pMesh(coneG, 0xD8D8D6); noseCone.position.z = -4.5; planeGroup.add(noseCone);
+
+// ── Colour stripe (orange, runs along cabin) ──
+var stripeO = pMesh(new THREE.BoxGeometry(1.27, 0.22, 4.42), 0xE8541A);
+stripeO.position.set(0, 0.18, -0.6); planeGroup.add(stripeO);
+var stripeO2 = pMesh(new THREE.BoxGeometry(1.02, 0.22, 3.62), 0xE8541A);
+stripeO2.position.set(0, 0.12, 2.9); planeGroup.add(stripeO2);
+// Thin blue stripe just below orange
+var stripeB = pMesh(new THREE.BoxGeometry(1.27, 0.10, 4.42), 0x1A4EAA);
+stripeB.position.set(0, -0.04, -0.6); planeGroup.add(stripeB);
+var stripeB2 = pMesh(new THREE.BoxGeometry(1.02, 0.10, 3.62), 0x1A4EAA);
+stripeB2.position.set(0, -0.04, 2.9); planeGroup.add(stripeB2);
+
+// ── Windows (dark tinted glass panels) ──
+[-1,1].forEach(function(s){
+  // Windshield sides
+  var ws = pMesh(new THREE.BoxGeometry(0.04, 0.68, 1.0), 0x223355);
+  ws.position.set(s*0.63, 0.42, -2.0); planeGroup.add(ws);
+  // Cabin side windows
+  var cw = pMesh(new THREE.BoxGeometry(0.04, 0.55, 1.65), 0x223355);
+  cw.position.set(s*0.63, 0.38, -0.55); planeGroup.add(cw);
+  // Rear quarter window
+  var rw = pMesh(new THREE.BoxGeometry(0.04, 0.42, 0.7), 0x223355);
+  rw.position.set(s*0.63, 0.30, 0.80); planeGroup.add(rw);
+});
+
+// ── High wing (sits on top of cabin) ──
+// Centre section (over cabin)
+var wingCentre = pMesh(new THREE.BoxGeometry(2.8, 0.18, 1.55), 0xF4F4F2);
+wingCentre.position.set(0, 0.82, -0.1); planeGroup.add(wingCentre);
+// Left & right outer panels with slight dihedral (+1°)
+[-1,1].forEach(function(s){
+  var wp = pMesh(new THREE.BoxGeometry(4.5, 0.14, 1.45), 0xF4F4F2);
+  wp.position.set(s*3.55, 0.88, -0.1);
+  wp.rotation.z = s * -0.018; // 1° dihedral
+  planeGroup.add(wp);
+  // Wing-tip nav light
+  var tip = pMesh(new THREE.SphereGeometry(0.07,6,6), s>0 ? 0x00FF44 : 0xFF3333);
+  tip.position.set(s*5.85, 0.88, -0.1); planeGroup.add(tip);
+});
+
+// ── Wing struts (diagonal, from cabin lower side to wing outer panel) ──
+[-1,1].forEach(function(s){
+  // Strut modelled as thin cylinder at an angle
+  var strutGeo = new THREE.CylinderGeometry(0.04, 0.04, 1.65, 6);
+  var strut = pMesh(strutGeo, 0xBBBBBB);
+  strut.position.set(s*2.1, 0.18, 0.05);
+  strut.rotation.z = s * 0.72; // ~41° lean
+  planeGroup.add(strut);
+});
+
+// ── Horizontal stabiliser ──
+var hStab = pMesh(new THREE.BoxGeometry(3.5, 0.11, 0.92), 0xF4F4F2);
+hStab.position.set(0, 0.25, 3.85); planeGroup.add(hStab);
+// Elevator accent stripe
+var elevStripe = pMesh(new THREE.BoxGeometry(3.5, 0.09, 0.92), 0xE8541A);
+elevStripe.position.set(0, 0.20, 3.85); planeGroup.add(elevStripe);
+
+// ── Vertical fin & rudder ──
+var vfin = pMesh(new THREE.BoxGeometry(0.11, 1.55, 1.05), 0xF4F4F2);
+vfin.position.set(0, 1.1, 3.45); planeGroup.add(vfin);
+var rudderStripe = pMesh(new THREE.BoxGeometry(0.12, 1.55, 0.22), 0xE8541A);
+rudderStripe.position.set(0, 1.1, 3.98); planeGroup.add(rudderStripe);
+
+// ── Tail light ──
+var tailLight = pMesh(new THREE.SphereGeometry(0.06,6,6), 0xFFFFAA);
+tailLight.position.set(0, 1.9, 3.5); planeGroup.add(tailLight);
+// Prop — two blades, tapered
+var propGroup = new THREE.Group(); propGroup.position.z = -5.1;
+[0, Math.PI].forEach(function(ang){
+  // Blade: wider at root, tapered toward tip — simulate with scaled box
+  var bl = pMesh(new THREE.BoxGeometry(0.03, 0.95, 0.055), 0x1A1A1A);
+  bl.rotation.z = ang;
+  propGroup.add(bl);
+});
+// Spinner hub cone
+var spinnerGeo = new THREE.ConeGeometry(0.18, 0.45, 8); spinnerGeo.rotateX(Math.PI / 2);
+var spinner = pMesh(spinnerGeo, 0x333333); spinner.position.z = -0.22; propGroup.add(spinner);
+// Motion-blur disc — shown at high RPM
+var blurDiscGeo = new THREE.CircleGeometry(1.15, 32); blurDiscGeo.rotateY(Math.PI / 2);
+var blurDiscMat = new THREE.MeshBasicMaterial({ color: 0x222222, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false });
+var blurDisc = new THREE.Mesh(blurDiscGeo, blurDiscMat); propGroup.add(blurDisc);
+planeGroup.add(propGroup);
+// Gear
+var gearGroup = new THREE.Group();
+function addGear(x,y,z){
+  var leg=pMesh(new THREE.CylinderGeometry(0.045,0.045,0.80,6),0x444444); leg.position.y=-0.40;
+  // rotation.y = π/2 makes wheel stand vertically (axle along X) so it looks like a real wheel
+  var whl=pMesh(new THREE.TorusGeometry(0.21,0.07,6,12),0x222222); whl.rotation.y=Math.PI/2; whl.position.y=-0.82;
+  var g=new THREE.Group(); g.add(leg); g.add(whl); g.position.set(x,y,z); gearGroup.add(g);
+}
+// x=±0.55 = just inside fuselage sides so legs emerge from the belly visually
+addGear(-0.55,-0.72,-0.3); addGear(0.55,-0.72,-0.3); addGear(0,-0.72,-3.2);
+planeGroup.add(gearGroup);
+scene.add(planeGroup);
+
+gltfLoader.load('models/cessna.glb', function(gltf) {
+  while (planeGroup.children.length) planeGroup.remove(planeGroup.children[0]);
+  gltf.scene.traverse(function(c){ if(c.isMesh){ c.castShadow=true; c.receiveShadow=true; } });
+  planeGroup.add(gltf.scene);
+  planeGroup.add(propGroup);
+}, undefined, function(){});
+
+// ─── Flight state ─────────────────────────────────────────────────
+var GEAR_OFFSET = 1.82;
+var state = {
+  pos:      new THREE.Vector3(RWY_X + RWY_LEN*0.5 - 15, 3 + GEAR_OFFSET, RWY_Z),
+  vel:      new THREE.Vector3(),
+  heading:  Math.PI * 1.5,  // 270° west = RWY 27
+  pitch:    0, roll: 0, rudder: 0,
+  throttle: 0,
+  gearDown: true,
+  airborne: false,
+  crashed:  false,
+  airspeed: 0, altitude: 0, vsi: 0, rpm: 700
+};
+var planeQuat = new THREE.Quaternion();
+
+// ─── Input ────────────────────────────────────────────────────────
+var keys = {};
+document.addEventListener('keydown', function(e) {
+  keys[e.code] = true;
+  if (e.code==='KeyG') toggleGear();
+  if (e.code==='KeyC') cycleCamera();
+  if (e.code==='KeyF') toggleFog();
+  if (e.code==='KeyN') toggleNight();
+  // Prevent arrow keys scrolling page
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].indexOf(e.code) > -1) e.preventDefault();
+});
+document.addEventListener('keyup', function(e) { keys[e.code] = false; });
+
+function toggleGear() { state.gearDown = !state.gearDown; gearGroup.visible = state.gearDown; }
+
+// ─── Cameras ──────────────────────────────────────────────────────
+var camMode = 0;
+var CAM_NAMES = ['CHASE CAM','COCKPIT','ORBIT'];
+var chaseCamPos = new THREE.Vector3();
+var chaseCamInit = false;
+var orbitCtrl = null;
+
+function cycleCamera() {
+  camMode = (camMode+1) % 3;
+  if (!orbitCtrl) {
+    orbitCtrl = new THREE.OrbitControls(camera, renderer.domElement);
+    orbitCtrl.enableDamping = true; orbitCtrl.dampingFactor = 0.06;
+  }
+  orbitCtrl.enabled = (camMode === 2);
+}
+
+// ─── Night / Fog ──────────────────────────────────────────────────
+var nightMode = false;
+function toggleFog() {
+  fogEnabled = !fogEnabled;
+  scene.fog = fogEnabled ? new THREE.FogExp2(nightMode ? FOG_COLOR_NIGHT : FOG_COLOR_DAY, 0.00018) : null;
+}
+function toggleNight() {
+  nightMode = !nightMode;
+  if (nightMode) {
+    scene.background.set(0x03050F);
+    ambient.intensity = 0.06; ambient.color.set(0x102030);
+    sun.intensity = 0.08;
+    scene.fog = fogEnabled ? new THREE.FogExp2(FOG_COLOR_NIGHT, 0.00025) : null;
+    starMesh.visible = true; townGlow.intensity = 2.5;
+    rwyLights.forEach(function(l){ l.visible=true; });
+  } else {
+    scene.background.set(0x87CEEB);
+    ambient.intensity = 0.55; ambient.color.set(0x8090B0);
+    sun.intensity = 1.8;
+    scene.fog = fogEnabled ? new THREE.FogExp2(FOG_COLOR_DAY, 0.00018) : null;
+    starMesh.visible = false; townGlow.intensity = 0;
+    rwyLights.forEach(function(l){ l.visible=false; });
+  }
+}
+
+// ─── Physics ──────────────────────────────────────────────────────
+var _fwd     = new THREE.Vector3();
+var _liftDir = new THREE.Vector3();
+var _accel   = new THREE.Vector3();
+var _yA      = new THREE.Vector3(0,1,0);
+
+function relax(v, rate, dt) { return v * Math.pow(1-rate, dt*60); }
+
+function updatePhysics(dt) {
+  if (state.crashed) return;
+
+  // Throttle
+  if (keys['NumpadAdd']      || keys['Equal']) state.throttle = Math.min(100, state.throttle + 38*dt);
+  if (keys['NumpadSubtract'] || keys['Minus']) state.throttle = Math.max(0,   state.throttle - 38*dt);
+
+  var pitchIn  = (keys['KeyW']||keys['ArrowDown'])  ? 1 : (keys['KeyS']||keys['ArrowUp'])    ? -1 : 0;
+  var rollIn   = (keys['KeyA']||keys['ArrowLeft'])  ? -1: (keys['KeyD']||keys['ArrowRight']) ?  1 : 0;
+  var rudderIn = keys['KeyQ'] ? -1 : keys['KeyE'] ? 1 : 0;
+
+  if (pitchIn  !== 0) state.pitch  += pitchIn  * 0.75 * dt;
+  else if (!state.airborne) state.pitch = relax(state.pitch, 0.04, dt);
+  // In air: pitch holds wherever you leave it — no self-leveling
+  if (rollIn   !== 0) state.roll   += rollIn   * 1.1  * dt; else state.roll   = relax(state.roll,   0.025,dt);
+  state.rudder += rudderIn * 0.45 * dt; state.rudder = relax(state.rudder, 0.12, dt);
+
+  state.pitch  = Math.max(-Math.PI/2.8, Math.min(Math.PI/2.8, state.pitch));
+  state.roll   = Math.max(-Math.PI/2,   Math.min(Math.PI/2,   state.roll));
+  state.rudder = Math.max(-0.5, Math.min(0.5, state.rudder));
+
+  // Rudder: on ground steers heading; in air yaws the velocity vector
+  if (!state.airborne) {
+    state.heading += state.rudder * 0.8 * dt;
+  } else if (Math.abs(state.rudder) > 0.02) {
+    var yaw = state.rudder * 0.35 * dt;
+    var cosY = Math.cos(yaw), sinY = Math.sin(yaw);
+    var nvx = state.vel.x * cosY - state.vel.z * sinY;
+    var nvz = state.vel.x * sinY + state.vel.z * cosY;
+    state.vel.x = nvx; state.vel.z = nvz;
+  }
+
+  // Orientation
+  // Negate heading: our aviation heading (0=N,90=E,270=W) maps to Three.js
+  // Y-rotation as -heading so forward (0,0,-1) lands on (sin H, 0, -cos H)
+  var hQ = new THREE.Quaternion().setFromAxisAngle(_yA, -state.heading);
+  var pQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0),  state.pitch);
+  var rQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,0,1), -state.roll);
+  planeQuat.copy(hQ).multiply(rQ).multiply(pQ);
+
+  _fwd.set(0,0,-1).applyQuaternion(planeQuat);
+  _liftDir.set(0,1,0).applyQuaternion(planeQuat);
+
+  // Forces
+  var tRatio = state.throttle / 100;
+  state.rpm = 700 + tRatio * 1800;
+
+  var vLen = state.vel.length();
+  state.airspeed = Math.hypot(state.vel.x, state.vel.z);
+  var velDir = vLen > 0.5 ? state.vel.clone().normalize() : _fwd.clone();
+  // AoA = difference between where nose points and where we're going (vertical component)
+  var aoaDeg = (_fwd.y - velDir.y);
+  var CL = Math.max(0, Math.min(1.4, 0.22 + 4.5 * aoaDeg));
+
+  var rho  = 1.225 * Math.exp(-state.pos.y / 8500);
+  var dynP = 0.5 * rho * vLen * vLen;
+  var lift = dynP * WING_AREA * CL;
+  var drag = dynP * WING_AREA * (0.026 + 0.04*state.pitch*state.pitch + (state.gearDown ? 0.010 : 0));
+
+  _accel.set(0,0,0);
+  _accel.addScaledVector(_fwd, (tRatio * MAX_THRUST) / MASS);
+  _accel.addScaledVector(_liftDir, lift / MASS);
+  if (vLen > 0.1) _accel.addScaledVector(state.vel, -drag / (MASS * vLen));
+  _accel.y -= GRAVITY;
+
+  state.vel.addScaledVector(_accel, dt);
+
+  // Ground
+  var groundY = getTerrainHeight(state.pos.x, state.pos.z);
+  var bottomY = state.pos.y - (state.gearDown ? GEAR_OFFSET : 0.25);
+
+  if (bottomY <= groundY) {
+    if (state.airborne && state.vel.y < -3.5) {
+      crash('Hard landing — ' + Math.round(-state.vel.y * MS2FPM) + ' fpm'); return;
+    }
+    state.pos.y = groundY + (state.gearDown ? GEAR_OFFSET : 0.25);
+    if (state.vel.y < 0) state.vel.y = 0;
+    state.airborne = false;
+    // Project velocity onto heading direction (prevents sideways drift)
+    var fwdX = Math.sin(state.heading), fwdZ = -Math.cos(state.heading);
+    var projSpd = state.vel.x * fwdX + state.vel.z * fwdZ;
+    // Rolling resistance: ~1.5 m/s² decel force (tires on tarmac)
+    // Aero drag already applied above; this just prevents infinite coasting
+    var rrSign = projSpd > 0 ? 1 : -1;
+    if (Math.abs(projSpd) > 0.05) projSpd -= rrSign * 1.5 * dt;
+    else projSpd = 0;
+    state.vel.x = fwdX * projSpd;
+    state.vel.z = fwdZ * projSpd;
+    state.pitch = relax(state.pitch, 0.15, dt);
+    state.roll  = relax(state.roll,  0.15, dt);
+  } else {
+    state.airborne = true;
+  }
+
+  state.pos.addScaledVector(state.vel, dt);
+
+  // In air: heading follows velocity so the plane actually flies where it's pointed
+  if (state.airborne && Math.hypot(state.vel.x, state.vel.z) > 3) {
+    state.heading = Math.atan2(state.vel.x, -state.vel.z);
+  }
+
+  state.altitude = state.pos.y;
+  state.vsi      = state.vel.y;
+
+  if (fogEnabled && !nightMode && scene.fog) {
+    scene.fog.density = Math.max(0.000015, 0.00022 - Math.max(0,state.altitude)*0.000028);
+  }
+
+  // Visual rotation capped at 120 RPM equivalent so blades remain visible; blur disc creates illusion above that
+  propGroup.rotation.z += (Math.min(state.rpm, 120) / 60) * Math.PI * 2 * dt;
+  // Blur disc: invisible at idle, solidifies above ~1200 RPM (motion blur illusion)
+  blurDisc.material.opacity = Math.max(0, Math.min(0.65, (state.rpm - 900) / 1400));
+}
+
+function crash(msg) {
+  state.crashed = true;
+  document.getElementById('crash-msg').textContent = msg;
+  document.getElementById('crash-screen').style.display = 'flex';
+}
+
+// ─── Camera update ────────────────────────────────────────────────
+var _ct = new THREE.Vector3();
+function updateCamera(dt) {
+  if (camMode === 0) {
+    var behind = new THREE.Vector3(0,9,26).applyQuaternion(planeQuat);
+    var wantPos = planeGroup.position.clone().add(behind);
+    if (!chaseCamInit) { chaseCamPos.copy(wantPos); chaseCamInit=true; }
+    chaseCamPos.lerp(wantPos, Math.min(1, 3.5*dt));
+    camera.position.copy(chaseCamPos);
+    _ct.copy(planeGroup.position).add(new THREE.Vector3(0,1.5,0));
+    camera.lookAt(_ct);
+  } else if (camMode === 1) {
+    var cpOff = new THREE.Vector3(0,1.2,-2.5).applyQuaternion(planeQuat);
+    camera.position.copy(planeGroup.position).add(cpOff);
+    var fwdTgt = planeGroup.position.clone().add(new THREE.Vector3(0,0.2,-50).applyQuaternion(planeQuat));
+    camera.lookAt(fwdTgt);
+  } else {
+    if (orbitCtrl) { orbitCtrl.target.copy(planeGroup.position); orbitCtrl.update(); }
+  }
+}
+
+// ─── HUD ──────────────────────────────────────────────────────────
+var hudCanvas = document.getElementById('hud');
+var hCtx = hudCanvas.getContext('2d');
+function resizeHUD() { hudCanvas.width = window.innerWidth; hudCanvas.height = window.innerHeight; }
+resizeHUD();
+
+function drawDial(ctx, cx, cy, r, label) {
+  ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2);
+  ctx.fillStyle='rgba(5,8,15,0.80)'; ctx.fill();
+  ctx.strokeStyle='#3A4A5A'; ctx.lineWidth=1.5; ctx.stroke();
+  ctx.fillStyle='#556'; ctx.font='10px monospace'; ctx.textAlign='center';
+  ctx.fillText(label, cx, cy+r+14);
+}
+function drawNeedle(ctx, cx, cy, angle, len, color, width) {
+  color = color || '#E8A010'; width = width || 2;
+  ctx.save(); ctx.translate(cx,cy); ctx.rotate(angle);
+  ctx.beginPath(); ctx.moveTo(0,5); ctx.lineTo(0,-len);
+  ctx.strokeStyle=color; ctx.lineWidth=width; ctx.stroke();
+  ctx.restore();
+}
+
+function drawHUD() {
+  var ctx = hCtx, W = hudCanvas.width, H = hudCanvas.height;
+  ctx.clearRect(0,0,W,H);
+
+  var asKt = state.airspeed * MS2KT;
+
+  // Stall warning
+  if (state.airborne && asKt < 30) {
+    if (Math.floor(Date.now()/400) % 2 === 0) {
+      ctx.fillStyle='rgba(255,30,30,0.85)'; ctx.font='bold 30px monospace'; ctx.textAlign='center';
+      ctx.fillText('⚠  STALL  ⚠', W*0.5, H*0.5-110);
+    }
+  }
+
+  // Airspeed — bottom left
+  var asCx=90, asCy=H-90, asR=62;
+  drawDial(ctx, asCx, asCy, asR, 'KIAS');
+  function asAngle(kt){ return -Math.PI/2 + (kt/160)*Math.PI*1.65; }
+  ctx.beginPath(); ctx.arc(asCx,asCy,asR-7,asAngle(V_X*MS2KT),asAngle(V_Y*MS2KT));
+  ctx.strokeStyle='#00CC44'; ctx.lineWidth=5; ctx.stroke();
+  for (var kt=0; kt<=160; kt+=10) {
+    var aa=asAngle(kt), maj=(kt%40===0);
+    var ac=Math.cos(aa), as2=Math.sin(aa);
+    ctx.beginPath();
+    ctx.moveTo(asCx+(asR-(maj?4:2))*ac, asCy+(asR-(maj?4:2))*as2);
+    ctx.lineTo(asCx+asR*ac, asCy+asR*as2);
+    ctx.strokeStyle=maj?'#CCC':'#666'; ctx.lineWidth=maj?1.5:1; ctx.stroke();
+    if (maj) { ctx.fillStyle='#AAA'; ctx.font='9px monospace'; ctx.textAlign='center'; ctx.fillText(kt, asCx+(asR-16)*ac, asCy+(asR-16)*as2+3); }
+  }
+  drawNeedle(ctx, asCx, asCy, asAngle(Math.min(asKt,160)), asR-5);
+  ctx.fillStyle='#E8A010'; ctx.font='bold 13px monospace'; ctx.textAlign='center';
+  ctx.fillText(Math.round(asKt), asCx, asCy+4);
+
+  // Altimeter — bottom right
+  var altCx=W-90, altCy=H-90, altR=62;
+  drawDial(ctx, altCx, altCy, altR, 'ALT ft');
+  var altFt = state.altitude * 3.28084;
+  function altAngle(ft){ return -Math.PI/2 + ((ft%10000)/10000)*Math.PI*2; }
+  for (var ft=0; ft<=10000; ft+=1000) {
+    var ata=altAngle(ft), amaj=(ft%2000===0);
+    var atc=Math.cos(ata), ats=Math.sin(ata);
+    ctx.beginPath();
+    ctx.moveTo(altCx+(altR-(amaj?5:2))*atc, altCy+(altR-(amaj?5:2))*ats);
+    ctx.lineTo(altCx+altR*atc, altCy+altR*ats);
+    ctx.strokeStyle=amaj?'#CCC':'#666'; ctx.lineWidth=amaj?1.5:1; ctx.stroke();
+    if (amaj) { ctx.fillStyle='#AAA'; ctx.font='9px monospace'; ctx.textAlign='center'; ctx.fillText(ft/1000+'k', altCx+(altR-16)*atc, altCy+(altR-16)*ats+3); }
+  }
+  drawNeedle(ctx, altCx, altCy, altAngle(altFt), altR-5);
+  ctx.fillStyle='#E8A010'; ctx.font='bold 13px monospace'; ctx.textAlign='center';
+  ctx.fillText(Math.round(altFt), altCx, altCy+4);
+
+  // Attitude indicator — bottom centre, between airspeed and altimeter
+  var aiCx=W*0.5, aiCy=H-90, aiR=55;
+  ctx.save(); ctx.beginPath(); ctx.arc(aiCx,aiCy,aiR,0,Math.PI*2); ctx.clip();
+  var pitchPx = state.pitch * (aiR*1.6);
+  ctx.save(); ctx.translate(aiCx,aiCy); ctx.rotate(-state.roll);
+  ctx.fillStyle='#8B5E3C'; ctx.fillRect(-aiR, pitchPx, aiR*2, aiR*2);
+  ctx.fillStyle='#1A5FA0'; ctx.fillRect(-aiR, -aiR*2+pitchPx, aiR*2, aiR*2);
+  ctx.beginPath(); ctx.moveTo(-aiR,pitchPx); ctx.lineTo(aiR,pitchPx);
+  ctx.strokeStyle='#FFF'; ctx.lineWidth=1.5; ctx.stroke();
+  for (var pd=-30; pd<=30; pd+=5) {
+    if (pd===0) continue;
+    var py=pitchPx-pd*(aiR/32), pw=pd%10===0?22:12;
+    ctx.beginPath(); ctx.moveTo(-pw,py); ctx.lineTo(pw,py);
+    ctx.strokeStyle='#FFF'; ctx.lineWidth=1; ctx.stroke();
+    if (pd%10===0){ ctx.fillStyle='#FFF'; ctx.font='9px monospace'; ctx.textAlign='right'; ctx.fillText(Math.abs(pd),-pw-3,py+3); }
+  }
+  ctx.restore(); ctx.restore();
+  ctx.beginPath(); ctx.arc(aiCx,aiCy,aiR,0,Math.PI*2); ctx.strokeStyle='#3A4A5A'; ctx.lineWidth=2; ctx.stroke();
+  ctx.strokeStyle='#FFA500'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(aiCx-28,aiCy); ctx.lineTo(aiCx-10,aiCy); ctx.lineTo(aiCx,aiCy+5); ctx.lineTo(aiCx+10,aiCy); ctx.lineTo(aiCx+28,aiCy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(aiCx-8,aiCy+5); ctx.lineTo(aiCx+8,aiCy+5); ctx.stroke();
+  ctx.fillStyle='#556'; ctx.font='10px monospace'; ctx.textAlign='center'; ctx.fillText('ATT',aiCx,aiCy+aiR+14);
+
+  // Heading tape — top center
+  var htW=200, htH=42, htX=W*0.5-100, htY=16;
+  ctx.fillStyle='rgba(5,8,15,0.80)'; ctx.fillRect(htX,htY,htW,htH);
+  ctx.strokeStyle='#3A4A5A'; ctx.lineWidth=1; ctx.strokeRect(htX,htY,htW,htH);
+  var hdg=((state.heading*180/Math.PI)%360+360)%360;
+  var cards={0:'N',45:'NE',90:'E',135:'SE',180:'S',225:'SW',270:'W',315:'NW'};
+  ctx.save(); ctx.rect(htX,htY,htW,htH); ctx.clip();
+  for (var dd2=-40; dd2<=40; dd2++) {
+    var ddd=((Math.round(hdg)+dd2)%360+360)%360;
+    if (ddd%5!==0) continue;
+    var px2=W*0.5+dd2*(htW/70);
+    var lbl=cards[ddd]||(ddd%10===0?ddd:null);
+    if (lbl){ ctx.fillStyle=ddd%30===0?'#DDD':'#888'; ctx.font=ddd%30===0?'bold 11px monospace':'10px monospace'; ctx.textAlign='center'; ctx.fillText(lbl,px2,htY+26); }
+    ctx.beginPath(); ctx.moveTo(px2,htY+htH-4); ctx.lineTo(px2,htY+htH); ctx.strokeStyle='#888'; ctx.lineWidth=1; ctx.stroke();
+  }
+  ctx.restore();
+  ctx.fillStyle='#E8A010'; ctx.font='bold 13px monospace'; ctx.textAlign='center'; ctx.fillText(Math.round(hdg)+'°', W*0.5, htY+13);
+  ctx.beginPath(); ctx.moveTo(W*0.5-5,htY+htH+1); ctx.lineTo(W*0.5+5,htY+htH+1); ctx.lineTo(W*0.5,htY+htH+7); ctx.closePath(); ctx.fillStyle='#E8A010'; ctx.fill();
+
+  // VSI — right center
+  var vsiCx=W-85, vsiCy=H*0.5, vsiR=52;
+  drawDial(ctx, vsiCx, vsiCy, vsiR, 'VSI fpm');
+  var vsiFpm=state.vsi*MS2FPM;
+  var vsiAng=Math.PI*0.5+(Math.max(-2000,Math.min(2000,vsiFpm))/2000)*Math.PI*0.78;
+  for (var vv=-2000; vv<=2000; vv+=500) {
+    var va=Math.PI*0.5+(vv/2000)*Math.PI*0.78;
+    ctx.beginPath(); ctx.moveTo(vsiCx+(vsiR-3)*Math.cos(va),vsiCy+(vsiR-3)*Math.sin(va));
+    ctx.lineTo(vsiCx+vsiR*Math.cos(va),vsiCy+vsiR*Math.sin(va));
+    ctx.strokeStyle='#666'; ctx.lineWidth=1; ctx.stroke();
+  }
+  drawNeedle(ctx, vsiCx, vsiCy, vsiAng, vsiR-6, vsiFpm>50?'#44FF88':vsiFpm<-50?'#FF6644':'#E8A010');
+  ctx.fillStyle=vsiFpm>50?'#44FF88':vsiFpm<-50?'#FF6644':'#E8A010';
+  ctx.font='bold 11px monospace'; ctx.textAlign='center';
+  ctx.fillText((vsiFpm>=0?'+':'')+Math.round(vsiFpm), vsiCx, vsiCy+4);
+
+  // Throttle bar — bottom center
+  var tbX=W*0.5-90, tbY=H-22, tbW=180, tbH=14;
+  ctx.fillStyle='rgba(5,8,15,0.80)'; ctx.fillRect(tbX-4,tbY-18,tbW+8,tbH+22);
+  ctx.fillStyle='#0D1A0D'; ctx.fillRect(tbX,tbY,tbW,tbH);
+  var tp2=state.throttle/100;
+  ctx.fillStyle='hsl('+(115-tp2*110)+',75%,42%)'; ctx.fillRect(tbX,tbY,tbW*tp2,tbH);
+  ctx.strokeStyle='#3A4A5A'; ctx.lineWidth=1; ctx.strokeRect(tbX,tbY,tbW,tbH);
+  ctx.fillStyle='#AAA'; ctx.font='11px monospace'; ctx.textAlign='center';
+  ctx.fillText('THR '+Math.round(state.throttle)+'%   RPM '+Math.round(state.rpm), W*0.5, tbY-4);
+
+  // Camera label — top left
+  ctx.fillStyle='rgba(5,8,15,0.75)'; ctx.fillRect(10,10,140,26);
+  ctx.fillStyle='#88FF88'; ctx.font='bold 12px monospace'; ctx.textAlign='left';
+  ctx.fillText(CAM_NAMES[camMode], 18, 27);
+
+  // Gear indicator — top right
+  ctx.fillStyle='rgba(5,8,15,0.75)'; ctx.fillRect(W-140,10,130,26);
+  ctx.fillStyle=state.gearDown?'#FF4444':'#44FF44';
+  ctx.font='bold 12px monospace'; ctx.textAlign='right';
+  ctx.fillText('GEAR '+(state.gearDown?'▼ DOWN':'▲ UP'), W-18, 27);
+
+  // Rudder indicator — small bar above throttle
+  var rdX = W*0.5, rdY = tbY - 28, rdHalfW = 40, rdH = 8;
+  ctx.fillStyle='rgba(5,8,15,0.80)'; ctx.fillRect(rdX-rdHalfW-2, rdY-rdH-2, rdHalfW*2+4, rdH+4);
+  ctx.strokeStyle='#3A4A5A'; ctx.lineWidth=1; ctx.strokeRect(rdX-rdHalfW-2, rdY-rdH-2, rdHalfW*2+4, rdH+4);
+  ctx.fillStyle='rgba(5,8,15,0.80)'; ctx.fillRect(rdX-rdHalfW, rdY-rdH, rdHalfW*2, rdH);
+  var rdFill = state.rudder * rdHalfW;
+  ctx.fillStyle='#4488FF';
+  if (rdFill > 0) ctx.fillRect(rdX, rdY-rdH, rdFill, rdH);
+  else ctx.fillRect(rdX+rdFill, rdY-rdH, -rdFill, rdH);
+  ctx.beginPath(); ctx.moveTo(rdX, rdY-rdH-3); ctx.lineTo(rdX, rdY+2); ctx.strokeStyle='#888'; ctx.lineWidth=1; ctx.stroke();
+  ctx.fillStyle='#556'; ctx.font='9px monospace'; ctx.textAlign='center';
+  ctx.fillText('RUD  Q ◄ ► E', rdX, rdY-rdH-5);
+
+  // Speed label
+  ctx.fillStyle='#00CC44'; ctx.font='9px monospace'; ctx.textAlign='left';
+  ctx.fillText('Vx '+Math.round(V_X*MS2KT)+'kt', 18, H-155);
+  ctx.fillText('Vy '+Math.round(V_Y*MS2KT)+'kt', 18, H-144);
+}
+
+// ─── Init & animate ───────────────────────────────────────────────
+var lastT = 0;
+
+try {
+  // Set initial orientation
+  var initHQ = new THREE.Quaternion().setFromAxisAngle(_yA, -state.heading);
+  planeQuat.copy(initHQ);
+  planeGroup.position.copy(state.pos);
+  planeGroup.quaternion.copy(planeQuat);
+  var initBehind = new THREE.Vector3(0,9,26).applyQuaternion(planeQuat);
+  chaseCamPos.copy(state.pos).add(initBehind);
+  camera.position.copy(chaseCamPos);
+  camera.lookAt(state.pos.x, state.pos.y, state.pos.z);
+  chaseCamInit = true;
+} catch(e) {
+  document.getElementById('loading').innerHTML =
+    '❌ Init error: ' + e.message +
+    '<br><small>Open F12 → Console for the full stack trace.</small>';
+  throw e;
+}
+
+document.getElementById('loading').style.display = 'none';
+document.getElementById('controls-hint').style.display = 'block';
+
+function animate(t) {
+  requestAnimationFrame(animate);
+  var dt = Math.min((t - lastT) / 1000, 0.05);
+  lastT = t;
+  waterMat.uniforms.uTime.value = t * 0.001;
+  updatePhysics(dt);
+  planeGroup.position.copy(state.pos);
+  planeGroup.quaternion.copy(planeQuat);
+  updateCamera(dt);
+  renderer.render(scene, camera);
+  drawHUD();
+}
+requestAnimationFrame(animate);
+
+window.addEventListener('resize', function() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  resizeHUD();
+});
+</script>
+</body>
+</html>
